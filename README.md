@@ -42,3 +42,4 @@ DEVELOPERS file for information on how to modify and test the library code
 itself.
 
 Please see http://qpid.apache.org/proton for a more info.
+
