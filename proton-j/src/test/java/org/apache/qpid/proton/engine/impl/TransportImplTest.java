@@ -1715,6 +1715,28 @@ public class TransportImplTest
         return delivery;
     }
 
+    private Delivery verifyDeliveryRawPayload(Receiver receiver, String deliveryTag, byte[] payload)
+    {
+        Delivery delivery = receiver.current();
+
+        assertTrue(Arrays.equals(deliveryTag.getBytes(StandardCharsets.UTF_8), delivery.getTag()));
+
+        assertFalse(delivery.isPartial());
+        assertTrue(delivery.isReadable());
+
+        byte[] received = new byte[delivery.pending()];
+        int len = receiver.recv(received, 0, BUFFER_SIZE);
+
+        assertEquals("unexpected length", len, received.length);
+
+        assertArrayEquals("Received delivery payload not as expected", payload, received);
+
+        boolean receiverAdvanced = receiver.advance();
+        assertTrue("receiver has not advanced", receiverAdvanced);
+
+        return delivery;
+    }
+
     /**
      * Verify that the {@link TransportInternal#addTransportLayer(TransportLayer)} has the desired
      * effect by observing the wrapping effect on related transport input and output methods.
@@ -2942,16 +2964,24 @@ public class TransportImplTest
         assertEquals("Unexpected delivery id", ((Disposition) frame).getLast(), UnsignedInteger.valueOf(2));
     }
 
-    private void handlePartialTransfer(TransportImpl transport, UnsignedInteger handle, int deliveryNumber, String deliveryTag, byte[] partialPayload, boolean more)
+    private void handlePartialTransfer(TransportImpl transport, UnsignedInteger handle, int deliveryId, String deliveryTag, byte[] partialPayload, boolean more)
+    {
+        handlePartialTransfer(transport, handle, UnsignedInteger.valueOf(deliveryId), deliveryTag, partialPayload, more);
+    }
+
+    private void handlePartialTransfer(TransportImpl transport, UnsignedInteger handle, UnsignedInteger deliveryId, String deliveryTag, byte[] partialPayload, boolean more)
     {
         byte[] tag = deliveryTag.getBytes(StandardCharsets.UTF_8);
 
         Transfer transfer = new Transfer();
-        transfer.setDeliveryId(UnsignedInteger.valueOf(deliveryNumber));
         transfer.setHandle(handle);
         transfer.setDeliveryTag(new Binary(tag));
         transfer.setMessageFormat(UnsignedInteger.valueOf(DeliveryImpl.DEFAULT_MESSAGE_FORMAT));
         transfer.setMore(more);
+        if(deliveryId != null) {
+            // Can be omitted in continuation frames for a given delivery.
+            transfer.setDeliveryId(deliveryId);
+        }
 
         transport.handleFrame(new TransportFrame(0, transfer, new Binary(partialPayload, 0, partialPayload.length)));
     }
@@ -2981,5 +3011,299 @@ public class TransportImplTest
         assertFalse("no payload chunks to return", payloadChunks.isEmpty());
 
         return payloadChunks;
+    }
+
+    @Test
+    public void testDeliveryIdOutOfSequenceCausesISE() {
+        MockTransportImpl transport = new MockTransportImpl();
+        transport.setEmitFlowEventOnSend(false);
+        Connection connection = Proton.connection();
+        transport.bind(connection);
+
+        connection.open();
+
+        Session session = connection.session();
+        session.open();
+
+        String linkName1 = "myReceiver1";
+        Receiver receiver1 = session.receiver(linkName1);
+        receiver1.flow(5);
+        receiver1.open();
+
+        String linkName2 = "myReceiver2";
+        Receiver receiver2 = session.receiver(linkName2);
+        receiver2.flow(5);
+        receiver2.open();
+
+        pumpMockTransport(transport);
+
+        final UnsignedInteger r1handle = UnsignedInteger.ZERO;
+        final UnsignedInteger r2handle = UnsignedInteger.ONE;
+
+        assertEquals("Unexpected frames written: " + getFrameTypesWritten(transport), 6, transport.writes.size());
+
+        // Send the necessary responses to open/begin/attach
+        transport.handleFrame(new TransportFrame(0, new Open(), null));
+
+        Begin begin = new Begin();
+        begin.setRemoteChannel(UnsignedShort.valueOf((short) 0));
+        begin.setNextOutgoingId(UnsignedInteger.ONE);
+        begin.setIncomingWindow(UnsignedInteger.valueOf(1024));
+        begin.setOutgoingWindow(UnsignedInteger.valueOf(1024));
+        transport.handleFrame(new TransportFrame(0, begin, null));
+
+        Attach attach1 = new Attach();
+        attach1.setHandle(r1handle);
+        attach1.setRole(Role.SENDER);
+        attach1.setName(linkName1);
+        attach1.setInitialDeliveryCount(UnsignedInteger.ZERO);
+        transport.handleFrame(new TransportFrame(0, attach1, null));
+
+        Attach attach2 = new Attach();
+        attach2.setHandle(r2handle);
+        attach2.setRole(Role.SENDER);
+        attach2.setName(linkName2);
+        attach2.setInitialDeliveryCount(UnsignedInteger.ZERO);
+        transport.handleFrame(new TransportFrame(0, attach2, null));
+
+        String deliveryTag1 = "tag1";
+        String deliveryTag2 = "tag2";
+
+        handlePartialTransfer(transport, r2handle, 2, deliveryTag2, new byte[]{ 2 }, false);
+        try {
+            handlePartialTransfer(transport, r1handle, 1, deliveryTag1, new byte[]{ 1 }, false);
+            fail("Expected an ISE");
+        } catch(IllegalStateException ise) {
+            // Expected
+            assertTrue("Unexpected exception:" + ise, ise.getMessage().contains("Expected delivery-id 3, got 1"));
+        }
+    }
+
+    @Test
+    public void testDeliveryIdMissingOnInitialTransferCausesISE() {
+        MockTransportImpl transport = new MockTransportImpl();
+        transport.setEmitFlowEventOnSend(false);
+        Connection connection = Proton.connection();
+        transport.bind(connection);
+
+        connection.open();
+
+        Session session = connection.session();
+        session.open();
+
+        String linkName1 = "myReceiver1";
+        Receiver receiver1 = session.receiver(linkName1);
+        receiver1.flow(5);
+        receiver1.open();
+
+        pumpMockTransport(transport);
+
+        final UnsignedInteger r1handle = UnsignedInteger.ZERO;
+
+        assertEquals("Unexpected frames written: " + getFrameTypesWritten(transport), 4, transport.writes.size());
+
+        // Send the necessary responses to open/begin/attach
+        transport.handleFrame(new TransportFrame(0, new Open(), null));
+
+        Begin begin = new Begin();
+        begin.setRemoteChannel(UnsignedShort.valueOf((short) 0));
+        begin.setNextOutgoingId(UnsignedInteger.ONE);
+        begin.setIncomingWindow(UnsignedInteger.valueOf(1024));
+        begin.setOutgoingWindow(UnsignedInteger.valueOf(1024));
+        transport.handleFrame(new TransportFrame(0, begin, null));
+
+        Attach attach1 = new Attach();
+        attach1.setHandle(r1handle);
+        attach1.setRole(Role.SENDER);
+        attach1.setName(linkName1);
+        attach1.setInitialDeliveryCount(UnsignedInteger.ZERO);
+        transport.handleFrame(new TransportFrame(0, attach1, null));
+
+        try {
+            handlePartialTransfer(transport, r1handle, null, "tag1", new byte[]{ 1 }, false);
+            fail("Expected an ISE");
+        } catch(IllegalStateException ise) {
+            // Expected
+            assertEquals("Unexpected message", "No delivery-id specified on first Transfer of new delivery", ise.getMessage());
+        }
+    }
+
+    @Test
+    public void testMultiplexDeliveriesOnSameReceiverLinkCausesISE() {
+        MockTransportImpl transport = new MockTransportImpl();
+        transport.setEmitFlowEventOnSend(false);
+        Connection connection = Proton.connection();
+        transport.bind(connection);
+
+        connection.open();
+
+        Session session = connection.session();
+        session.open();
+
+        String linkName1 = "myReceiver1";
+        Receiver receiver1 = session.receiver(linkName1);
+        receiver1.flow(5);
+        receiver1.open();
+
+        pumpMockTransport(transport);
+
+        final UnsignedInteger r1handle = UnsignedInteger.ZERO;
+
+        assertEquals("Unexpected frames written: " + getFrameTypesWritten(transport), 4, transport.writes.size());
+
+        // Send the necessary responses to open/begin/attach
+        transport.handleFrame(new TransportFrame(0, new Open(), null));
+
+        Begin begin = new Begin();
+        begin.setRemoteChannel(UnsignedShort.valueOf((short) 0));
+        begin.setNextOutgoingId(UnsignedInteger.ONE);
+        begin.setIncomingWindow(UnsignedInteger.valueOf(1024));
+        begin.setOutgoingWindow(UnsignedInteger.valueOf(1024));
+        transport.handleFrame(new TransportFrame(0, begin, null));
+
+        Attach attach1 = new Attach();
+        attach1.setHandle(r1handle);
+        attach1.setRole(Role.SENDER);
+        attach1.setName(linkName1);
+        attach1.setInitialDeliveryCount(UnsignedInteger.ZERO);
+        transport.handleFrame(new TransportFrame(0, attach1, null));
+
+        handlePartialTransfer(transport, r1handle, 1, "tag1", new byte[]{ 1 }, true);
+        try {
+            handlePartialTransfer(transport, r1handle, 2, "tag2", new byte[]{ 2 }, true);
+            fail("Expected an ISE");
+        } catch(IllegalStateException ise) {
+            // Expected
+            assertEquals("Unexpected message", "Illegal multiplex of deliveries on same link with delivery-id 1 and 2", ise.getMessage());
+        }
+    }
+
+    @Test
+    public void testDeliveryIdOmittedOnContinuationTransfers() {
+        MockTransportImpl transport = new MockTransportImpl();
+        transport.setEmitFlowEventOnSend(false);
+        Connection connection = Proton.connection();
+        transport.bind(connection);
+
+        connection.open();
+
+        Session session = connection.session();
+        session.open();
+
+        String linkName1 = "myReceiver1";
+        Receiver receiver1 = session.receiver(linkName1);
+        receiver1.flow(5);
+        receiver1.open();
+
+        String linkName2 = "myReceiver2";
+        Receiver receiver2 = session.receiver(linkName2);
+        receiver2.flow(5);
+        receiver2.open();
+
+        pumpMockTransport(transport);
+
+        final UnsignedInteger r1handle = UnsignedInteger.ZERO;
+        final UnsignedInteger r2handle = UnsignedInteger.ONE;
+
+        assertEquals("Unexpected frames written: " + getFrameTypesWritten(transport), 6, transport.writes.size());
+
+        // Send the necessary responses to open/begin/attach
+        transport.handleFrame(new TransportFrame(0, new Open(), null));
+
+        Begin begin = new Begin();
+        begin.setRemoteChannel(UnsignedShort.valueOf((short) 0));
+        begin.setNextOutgoingId(UnsignedInteger.ONE);
+        begin.setIncomingWindow(UnsignedInteger.valueOf(1024));
+        begin.setOutgoingWindow(UnsignedInteger.valueOf(1024));
+        transport.handleFrame(new TransportFrame(0, begin, null));
+
+        Attach attach1 = new Attach();
+        attach1.setHandle(r1handle);
+        attach1.setRole(Role.SENDER);
+        attach1.setName(linkName1);
+        attach1.setInitialDeliveryCount(UnsignedInteger.ZERO);
+        transport.handleFrame(new TransportFrame(0, attach1, null));
+
+        Attach attach2 = new Attach();
+        attach2.setHandle(r2handle);
+        attach2.setRole(Role.SENDER);
+        attach2.setName(linkName2);
+        attach2.setInitialDeliveryCount(UnsignedInteger.ZERO);
+        transport.handleFrame(new TransportFrame(0, attach2, null));
+
+        String deliveryTag1 = "tag1";
+        String deliveryTag2 = "tag2";
+
+        handlePartialTransfer(transport, r1handle, 1, deliveryTag1, new byte[]{ 1 }, true);
+        handlePartialTransfer(transport, r2handle, 2, deliveryTag2, new byte[]{ 101 }, true);
+        handlePartialTransfer(transport, r2handle, null, deliveryTag2, new byte[]{ 102 }, true);
+        handlePartialTransfer(transport, r1handle, null, deliveryTag1, new byte[]{ 2 }, true);
+        handlePartialTransfer(transport, r1handle, null, deliveryTag1, new byte[]{ 3 }, false);
+        handlePartialTransfer(transport, r2handle, null, deliveryTag2, new byte[]{ 103 }, true);
+        handlePartialTransfer(transport, r2handle, null, deliveryTag2, new byte[]{ 104 }, false);
+
+        verifyDeliveryRawPayload(receiver1, deliveryTag1, new byte[] { 1, 2, 3 });
+        verifyDeliveryRawPayload(receiver2, deliveryTag2, new byte[] { 101, 102, 103, 104 });
+    }
+
+    @Test
+    public void testDeliveryIdThresholdsWraps() {
+        doDeliveryIdThresholdsWrapsTestImpl(UnsignedInteger.ZERO, UnsignedInteger.ONE, UnsignedInteger.valueOf(2));
+        doDeliveryIdThresholdsWrapsTestImpl(UnsignedInteger.valueOf(Integer.MAX_VALUE - 2), UnsignedInteger.valueOf(Integer.MAX_VALUE -1), UnsignedInteger.valueOf(Integer.MAX_VALUE));
+        long start = Integer.MAX_VALUE;
+        doDeliveryIdThresholdsWrapsTestImpl(UnsignedInteger.valueOf(start), UnsignedInteger.valueOf(start + 1), UnsignedInteger.valueOf(start + 2));
+        doDeliveryIdThresholdsWrapsTestImpl(UnsignedInteger.MAX_VALUE, UnsignedInteger.MAX_VALUE.add(UnsignedInteger.ONE), UnsignedInteger.MAX_VALUE.add(UnsignedInteger.valueOf(2)));
+    }
+
+    private void doDeliveryIdThresholdsWrapsTestImpl(UnsignedInteger deliveryId1, UnsignedInteger deliveryId2, UnsignedInteger deliveryId3) {
+        MockTransportImpl transport = new MockTransportImpl();
+        transport.setEmitFlowEventOnSend(false);
+        Connection connection = Proton.connection();
+        transport.bind(connection);
+
+        connection.open();
+
+        Session session = connection.session();
+        session.open();
+
+        String linkName1 = "myReceiver1";
+        Receiver receiver1 = session.receiver(linkName1);
+        receiver1.flow(5);
+        receiver1.open();
+
+        pumpMockTransport(transport);
+
+        final UnsignedInteger r1handle = UnsignedInteger.ZERO;
+
+        assertEquals("Unexpected frames written: " + getFrameTypesWritten(transport), 4, transport.writes.size());
+
+        // Send the necessary responses to open/begin/attach
+        transport.handleFrame(new TransportFrame(0, new Open(), null));
+
+        Begin begin = new Begin();
+        begin.setRemoteChannel(UnsignedShort.valueOf((short) 0));
+        begin.setNextOutgoingId(UnsignedInteger.ONE);
+        begin.setIncomingWindow(UnsignedInteger.valueOf(1024));
+        begin.setOutgoingWindow(UnsignedInteger.valueOf(1024));
+        transport.handleFrame(new TransportFrame(0, begin, null));
+
+        Attach attach1 = new Attach();
+        attach1.setHandle(r1handle);
+        attach1.setRole(Role.SENDER);
+        attach1.setName(linkName1);
+        attach1.setInitialDeliveryCount(UnsignedInteger.ZERO);
+        transport.handleFrame(new TransportFrame(0, attach1, null));
+
+        String deliveryTag1 = "tag1";
+        String deliveryTag2 = "tag2";
+        String deliveryTag3 = "tag3";
+
+        handlePartialTransfer(transport, r1handle, deliveryId1, deliveryTag1, new byte[]{ 1 }, false);
+        handlePartialTransfer(transport, r1handle, deliveryId2, deliveryTag2, new byte[]{ 2 }, false);
+        handlePartialTransfer(transport, r1handle, deliveryId3, deliveryTag3, new byte[]{ 3 }, false);
+
+        verifyDeliveryRawPayload(receiver1, deliveryTag1, new byte[] { 1 });
+        verifyDeliveryRawPayload(receiver1, deliveryTag2, new byte[] { 2 });
+        verifyDeliveryRawPayload(receiver1, deliveryTag3, new byte[] { 3 });
     }
 }

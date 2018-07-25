@@ -277,10 +277,10 @@ class TransportSession
         }
         else
         {
-            // TODO - check deliveryId is present, we need one for the first Transfer of a delivery.
-            // TODO - check another delivery isnt already in progress for the link, not allowed to mux on a link.
-            // TODO - check deliveryId has been incremented by one
-            _incomingDeliveryId = transfer.getDeliveryId();
+            verifyNewDeliveryIdSequence(_incomingDeliveryId, linkIncomingDeliveryId, deliveryId);
+
+            _incomingDeliveryId = deliveryId;
+
             ReceiverImpl receiver = transportReceiver.getReceiver();
             Binary deliveryTag = transfer.getDeliveryTag();
             delivery = receiver.delivery(deliveryTag.getArray(), deliveryTag.getArrayOffset(),
@@ -330,6 +330,22 @@ class TransportSession
         }
 
         getSession().getConnection().put(Event.Type.DELIVERY, delivery);
+    }
+
+    private void verifyNewDeliveryIdSequence(UnsignedInteger previousId, UnsignedInteger linkIncomingId, UnsignedInteger newDeliveryId) {
+        if(newDeliveryId == null) {
+            throw new IllegalStateException("No delivery-id specified on first Transfer of new delivery");
+        }
+
+        // Doing a primitive comparison, uses intValue() since its a uint sequence
+        // and we need the primitive values to wrap appropriately during comparison.
+        if(previousId != null && previousId.intValue() + 1 != newDeliveryId.intValue()) {
+            throw new IllegalStateException("Expected delivery-id " + previousId.add(UnsignedInteger.ONE) + ", got " + newDeliveryId);
+        }
+
+        if(linkIncomingId != null) {
+            throw new IllegalStateException("Illegal multiplex of deliveries on same link with delivery-id " + linkIncomingId + " and " + newDeliveryId);
+        }
     }
 
     public void freeLocalChannel()
