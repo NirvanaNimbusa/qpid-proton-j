@@ -264,22 +264,23 @@ class TransportSession
     public void handleTransfer(Transfer transfer, Binary payload)
     {
         DeliveryImpl delivery;
-        incrementNextIncomingId();
-        if(transfer.getDeliveryId() == null || transfer.getDeliveryId().equals(_incomingDeliveryId))
-        {
-            TransportReceiver transportReceiver = (TransportReceiver) getLinkFromRemoteHandle(transfer.getHandle());
-            ReceiverImpl receiver = transportReceiver.getReceiver();
-            Binary deliveryTag = transfer.getDeliveryTag();
-            delivery = _unsettledIncomingDeliveriesById.get(_incomingDeliveryId);
-            delivery.getTransportDelivery().incrementSessionSize();
+        incrementNextIncomingId(); // The conceptual/non-wire transfer-id, for the session window.
 
+        TransportReceiver transportReceiver = (TransportReceiver) getLinkFromRemoteHandle(transfer.getHandle());
+        UnsignedInteger linkIncomingDeliveryId = transportReceiver.getIncomingDeliveryId();
+        UnsignedInteger deliveryId = transfer.getDeliveryId();
+
+        if(linkIncomingDeliveryId != null && (linkIncomingDeliveryId.equals(deliveryId) || deliveryId == null))
+        {
+            delivery = _unsettledIncomingDeliveriesById.get(linkIncomingDeliveryId);
+            delivery.getTransportDelivery().incrementSessionSize();
         }
         else
         {
+            // TODO - check deliveryId is present, we need one for the first Transfer of a delivery.
+            // TODO - check another delivery isnt already in progress for the link, not allowed to mux on a link.
             // TODO - check deliveryId has been incremented by one
             _incomingDeliveryId = transfer.getDeliveryId();
-            // TODO - check link handle valid and a receiver
-            TransportReceiver transportReceiver = (TransportReceiver) getLinkFromRemoteHandle(transfer.getHandle());
             ReceiverImpl receiver = transportReceiver.getReceiver();
             Binary deliveryTag = transfer.getDeliveryTag();
             delivery = receiver.delivery(deliveryTag.getArray(), deliveryTag.getArrayOffset(),
@@ -288,11 +289,13 @@ class TransportSession
             if(messageFormat != null) {
                 delivery.setMessageFormat(messageFormat.intValue());
             }
-            TransportDelivery transportDelivery = new TransportDelivery(_incomingDeliveryId, delivery, transportReceiver);
+            TransportDelivery transportDelivery = new TransportDelivery(deliveryId, delivery, transportReceiver);
             delivery.setTransportDelivery(transportDelivery);
-            _unsettledIncomingDeliveriesById.put(_incomingDeliveryId, delivery);
+            transportReceiver.setIncomingDeliveryId(deliveryId);
+            _unsettledIncomingDeliveriesById.put(deliveryId, delivery);
             getSession().incrementIncomingDeliveries(1);
         }
+
         if( transfer.getState()!=null )
         {
             delivery.setRemoteDeliveryState(transfer.getState());
@@ -310,6 +313,7 @@ class TransportSession
         if(!(transfer.getMore() || transfer.getAborted()))
         {
             delivery.setComplete();
+            transportReceiver.setIncomingDeliveryId(null);
             delivery.getLink().getTransportLink().decrementLinkCredit();
             delivery.getLink().getTransportLink().incrementDeliveryCount();
         }

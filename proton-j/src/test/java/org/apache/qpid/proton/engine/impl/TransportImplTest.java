@@ -34,18 +34,21 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedList;
+import java.util.List;
 import java.util.Random;
 
 import org.apache.qpid.proton.Proton;
 import org.apache.qpid.proton.amqp.Binary;
 import org.apache.qpid.proton.amqp.UnsignedInteger;
 import org.apache.qpid.proton.amqp.UnsignedShort;
+import org.apache.qpid.proton.amqp.messaging.Accepted;
 import org.apache.qpid.proton.amqp.messaging.AmqpValue;
 import org.apache.qpid.proton.amqp.messaging.Released;
 import org.apache.qpid.proton.amqp.transport.Attach;
 import org.apache.qpid.proton.amqp.transport.Begin;
 import org.apache.qpid.proton.amqp.transport.Close;
 import org.apache.qpid.proton.amqp.transport.Detach;
+import org.apache.qpid.proton.amqp.transport.Disposition;
 import org.apache.qpid.proton.amqp.transport.End;
 import org.apache.qpid.proton.amqp.transport.Flow;
 import org.apache.qpid.proton.amqp.transport.FrameBody;
@@ -2645,16 +2648,16 @@ public class TransportImplTest
     }
 
     @Test
-    public void testMultiplexMultiFrameDeliveryOnSingleSession() {
-        doMultiplexMultiFrameDeliveryOnSingleSessionTestImpl(false);
+    public void testMultiplexMultiFrameDeliveryOnSingleSessionOutgoing() {
+        doMultiplexMultiFrameDeliveryOnSingleSessionOutgoingTestImpl(false);
     }
 
     @Test
-    public void testMultiplexMultiFrameDeliveriesOnSingleSession() {
-        doMultiplexMultiFrameDeliveryOnSingleSessionTestImpl(true);
+    public void testMultiplexMultiFrameDeliveriesOnSingleSessionOutgoing() {
+        doMultiplexMultiFrameDeliveryOnSingleSessionOutgoingTestImpl(true);
     }
 
-    private void doMultiplexMultiFrameDeliveryOnSingleSessionTestImpl(boolean bothDeliveriesMultiFrame) {
+    private void doMultiplexMultiFrameDeliveryOnSingleSessionOutgoingTestImpl(boolean bothDeliveriesMultiFrame) {
         MockTransportImpl transport = new MockTransportImpl();
         transport.setEmitFlowEventOnSend(false);
 
@@ -2787,5 +2790,196 @@ public class TransportImplTest
             assertEquals("Unexpected deliveryId", UnsignedInteger.ONE, transfer.getDeliveryId());
             assertEquals("Unexpected more flag", false, transfer.getMore());
         }
+    }
+
+    @Test
+    public void testMultiplexMultiFrameDeliveriesOnSingleSessionIncoming() {
+        doMultiplexMultiFrameDeliveryOnSingleSessionIncomingTestImpl(true);
+    }
+
+    @Test
+    public void testMultiplexMultiFrameDeliveryOnSingleSessionIncoming() {
+        doMultiplexMultiFrameDeliveryOnSingleSessionIncomingTestImpl(false);
+    }
+
+    private void doMultiplexMultiFrameDeliveryOnSingleSessionIncomingTestImpl(boolean bothDeliveriesMultiFrame) {
+        int contentLength1 = 7000;
+        int maxPayloadChunkSize = 2000;
+        int contentLength2 = 1000;
+        if(bothDeliveriesMultiFrame) {
+            contentLength2 = 3000;
+        }
+
+        MockTransportImpl transport = new MockTransportImpl();
+        transport.setEmitFlowEventOnSend(false);
+        Connection connection = Proton.connection();
+        transport.bind(connection);
+
+        connection.open();
+
+        Session session = connection.session();
+        session.open();
+
+        String linkName1 = "myReceiver1";
+        Receiver receiver1 = session.receiver(linkName1);
+        receiver1.flow(5);
+        receiver1.open();
+
+        String linkName2 = "myReceiver2";
+        Receiver receiver2 = session.receiver(linkName2);
+        receiver2.flow(5);
+        receiver2.open();
+
+        pumpMockTransport(transport);
+
+        final UnsignedInteger r1handle = UnsignedInteger.ZERO;
+        final UnsignedInteger r2handle = UnsignedInteger.ONE;
+
+        assertEquals("Unexpected frames written: " + getFrameTypesWritten(transport), 6, transport.writes.size());
+
+        assertTrue("Unexpected frame type", transport.writes.get(0) instanceof Open);
+        assertTrue("Unexpected frame type", transport.writes.get(1) instanceof Begin);
+        FrameBody frame = transport.writes.get(2);
+        assertTrue("Unexpected frame type", frame instanceof Attach);
+        assertEquals("Unexpected handle", ((Attach) frame).getHandle(), r1handle);
+        frame = transport.writes.get(3);
+        assertTrue("Unexpected frame type", frame instanceof Attach);
+        assertEquals("Unexpected handle", ((Attach) frame).getHandle(), r2handle);
+        frame = transport.writes.get(4);
+        assertTrue("Unexpected frame type", frame instanceof Flow);
+        assertEquals("Unexpected handle", ((Flow) frame).getHandle(), r1handle);
+        frame = transport.writes.get(5);
+        assertTrue("Unexpected frame type", frame instanceof Flow);
+        assertEquals("Unexpected handle", ((Flow) frame).getHandle(), r2handle);
+
+        assertNull("Should not yet have a delivery", receiver1.current());
+        assertNull("Should not yet have a delivery", receiver2.current());
+
+        // Send the necessary responses to open/begin/attach
+        transport.handleFrame(new TransportFrame(0, new Open(), null));
+
+        Begin begin = new Begin();
+        begin.setRemoteChannel(UnsignedShort.valueOf((short) 0));
+        begin.setNextOutgoingId(UnsignedInteger.ONE);
+        begin.setIncomingWindow(UnsignedInteger.valueOf(1024));
+        begin.setOutgoingWindow(UnsignedInteger.valueOf(1024));
+        transport.handleFrame(new TransportFrame(0, begin, null));
+
+        Attach attach1 = new Attach();
+        attach1.setHandle(r1handle);
+        attach1.setRole(Role.SENDER);
+        attach1.setName(linkName1);
+        attach1.setInitialDeliveryCount(UnsignedInteger.ZERO);
+        transport.handleFrame(new TransportFrame(0, attach1, null));
+
+        Attach attach2 = new Attach();
+        attach2.setHandle(r2handle);
+        attach2.setRole(Role.SENDER);
+        attach2.setName(linkName2);
+        attach2.setInitialDeliveryCount(UnsignedInteger.ZERO);
+        transport.handleFrame(new TransportFrame(0, attach2, null));
+
+        String deliveryTag1 = "tag1";
+        String messageContent1 = createLargeContent(contentLength1);
+        String deliveryTag2 = "tag2";
+        String messageContent2 = createLargeContent(contentLength2);
+
+        ArrayList<byte[]> message1chunks = createTransferPayloads(messageContent1, maxPayloadChunkSize);
+        assertTrue("unexpected number of payload chunks", message1chunks.size() > 2);
+        ArrayList<byte[]> message2chunks = createTransferPayloads(messageContent2, maxPayloadChunkSize);
+        if(bothDeliveriesMultiFrame) {
+            assertTrue("unexpected number of payload chunks", message1chunks.size() > 2);
+        } else {
+            assertTrue("unexpected number of payload chunks", message2chunks.size() == 1);
+        }
+
+        while (true) {
+           if (!message1chunks.isEmpty()) {
+              byte[] chunk = message1chunks.remove(0);
+              handlePartialTransfer(transport, r1handle, 1, deliveryTag1, chunk, !message1chunks.isEmpty());
+           }
+
+           if (!message2chunks.isEmpty()) {
+               byte[] chunk = message2chunks.remove(0);
+               handlePartialTransfer(transport, r2handle, 2, deliveryTag2, chunk, !message2chunks.isEmpty());
+            }
+
+           if (message1chunks.isEmpty() && message2chunks.isEmpty()) {
+              break;
+           }
+        }
+
+        assertEquals("Unexpected frames written: " + getFrameTypesWritten(transport), 6, transport.writes.size());
+
+        assertEquals("Unexpected queued count", 1, receiver1.getQueued());
+        Delivery delivery1 = verifyDelivery(receiver1, deliveryTag1, messageContent1);
+        assertNotNull("Should now have a delivery", delivery1);
+        assertEquals("Unexpected queued count", 0, receiver1.getQueued());
+
+        assertEquals("Unexpected queued count", 1, receiver2.getQueued());
+        Delivery delivery2 = verifyDelivery(receiver2, deliveryTag2, messageContent2);
+        assertNotNull("Should now have a delivery", delivery2);
+        assertEquals("Unexpected queued count", 0, receiver2.getQueued());
+
+        delivery1.disposition(Accepted.getInstance());
+        delivery1.settle();
+        pumpMockTransport(transport);
+        assertEquals("Unexpected frames written: " + getFrameTypesWritten(transport), 7, transport.writes.size());
+
+        frame = transport.writes.get(6);
+        assertTrue("Unexpected frame type", frame instanceof Disposition);
+        assertEquals("Unexpected delivery id", ((Disposition) frame).getFirst(), UnsignedInteger.ONE);
+        assertEquals("Unexpected delivery id", ((Disposition) frame).getLast(), UnsignedInteger.ONE);
+
+        delivery2.disposition(Accepted.getInstance());
+        delivery2.settle();
+        pumpMockTransport(transport);
+        assertEquals("Unexpected frames written: " + getFrameTypesWritten(transport), 8, transport.writes.size());
+
+        frame = transport.writes.get(7);
+        assertTrue("Unexpected frame type", frame instanceof Disposition);
+        assertEquals("Unexpected delivery id", ((Disposition) frame).getFirst(), UnsignedInteger.valueOf(2));
+        assertEquals("Unexpected delivery id", ((Disposition) frame).getLast(), UnsignedInteger.valueOf(2));
+    }
+
+    private void handlePartialTransfer(TransportImpl transport, UnsignedInteger handle, int deliveryNumber, String deliveryTag, byte[] partialPayload, boolean more)
+    {
+        byte[] tag = deliveryTag.getBytes(StandardCharsets.UTF_8);
+
+        Transfer transfer = new Transfer();
+        transfer.setDeliveryId(UnsignedInteger.valueOf(deliveryNumber));
+        transfer.setHandle(handle);
+        transfer.setDeliveryTag(new Binary(tag));
+        transfer.setMessageFormat(UnsignedInteger.valueOf(DeliveryImpl.DEFAULT_MESSAGE_FORMAT));
+        transfer.setMore(more);
+
+        transport.handleFrame(new TransportFrame(0, transfer, new Binary(partialPayload, 0, partialPayload.length)));
+    }
+
+    private ArrayList<byte[]> createTransferPayloads(String content, int payloadChunkSize)
+    {
+        ArrayList<byte[]> payloadChunks = new ArrayList<>();
+
+        Message m = Message.Factory.create();
+        m.setBody(new AmqpValue(content));
+
+        byte[] encoded = new byte[BUFFER_SIZE];
+        int len = m.encode(encoded, 0, BUFFER_SIZE);
+        assertTrue("given array was too small", len < BUFFER_SIZE);
+
+        int copied = 0;
+        while(copied < len) {
+            int chunkSize = Math.min(len - copied, payloadChunkSize);
+            byte[] chunk = new byte[chunkSize];
+
+            System.arraycopy(encoded, copied, chunk, 0, chunkSize);
+
+            payloadChunks.add(chunk);
+            copied += chunkSize;
+        }
+
+        assertFalse("no payload chunks to return", payloadChunks.isEmpty());
+
+        return payloadChunks;
     }
 }
