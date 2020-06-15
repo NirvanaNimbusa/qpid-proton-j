@@ -4,6 +4,8 @@ matrix:
     - os: linux
       jdk: openjdk8
       dist: xenial
+      env:
+        - EXAMPLES_PROFILE="release"
     - os: linux
       jdk: openjdk11
       dist: xenial
@@ -11,4 +13,5 @@ cache:
   directories:
   - $HOME/.m2
 before_cache:
+  - mvn package -P${EXAMPLES_PROFILE:-noRun}
   - rm -rf $HOME/.m2/repository/org/apache/qpid/*
