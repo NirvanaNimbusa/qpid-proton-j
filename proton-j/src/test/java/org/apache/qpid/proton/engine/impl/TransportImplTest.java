@@ -67,6 +67,7 @@ import org.apache.qpid.proton.codec.ReadableBuffer;
 import org.apache.qpid.proton.engine.Collector;
 import org.apache.qpid.proton.engine.Connection;
 import org.apache.qpid.proton.engine.Delivery;
+import org.apache.qpid.proton.engine.Endpoint;
 import org.apache.qpid.proton.engine.EndpointState;
 import org.apache.qpid.proton.engine.Event;
 import org.apache.qpid.proton.engine.Link;
@@ -4143,7 +4144,7 @@ public class TransportImplTest
 
         Attach attach = new Attach();
         attach.setHandle(UnsignedInteger.ZERO);
-        attach.setRole(Role.SENDER);
+        attach.setRole(Role.RECEIVER);
         attach.setName(linkName);
         attach.setInitialDeliveryCount(UnsignedInteger.ZERO);
         transport.handleFrame(new TransportFrame(0, attach, null));
@@ -4589,5 +4590,94 @@ public class TransportImplTest
 
         assertEquals("Unexpected frames written: " + getFrameTypesWritten(transport), 6, transport.writes.size());
         assertTrue("Unexpected frame type", transport.writes.get(5) instanceof Close);
+    }
+
+    @Test
+    public void testOpenSenderAndReceiverLinksAtSameTimeWithSameLinkName() {
+        MockTransportImpl transport = new MockTransportImpl();
+        transport.setEmitFlowEventOnSend(false);
+        Connection connection = Proton.connection();
+        transport.bind(connection);
+
+        Collector collector = Collector.Factory.create();
+        connection.collect(collector);
+
+        connection.open();
+
+        Session session = connection.session();
+        session.open();
+
+        pumpMockTransport(transport);
+
+        assertEquals("Unexpected frames written: " + getFrameTypesWritten(transport), 2, transport.writes.size());
+
+        assertEvents(collector, Event.Type.CONNECTION_INIT, Event.Type.CONNECTION_LOCAL_OPEN, Event.Type.TRANSPORT,
+                Event.Type.SESSION_INIT, Event.Type.SESSION_LOCAL_OPEN, Event.Type.TRANSPORT);
+
+        // Give the necessary responses to open/begin
+        transport.handleFrame(new TransportFrame(0, new Open(), null));
+
+        Begin begin = new Begin();
+        begin.setRemoteChannel(UnsignedShort.valueOf((short) 0));
+        begin.setNextOutgoingId(UnsignedInteger.ONE);
+        begin.setIncomingWindow(UnsignedInteger.valueOf(1024));
+        begin.setOutgoingWindow(UnsignedInteger.valueOf(1024));
+        transport.handleFrame(new TransportFrame(0, begin, null));
+
+        final UnsignedInteger receiverHandle = UnsignedInteger.ZERO;
+        final UnsignedInteger senderHandle = UnsignedInteger.ONE;
+
+        // Open a receiver and a sender at same time, with same link name
+
+        String linkName = "myLinkName";
+        Receiver receiver = session.receiver(linkName);
+        assertEndpointState(receiver, EndpointState.UNINITIALIZED, EndpointState.UNINITIALIZED);
+
+        Sender sender = session.sender(linkName);
+        assertEndpointState(sender, EndpointState.UNINITIALIZED, EndpointState.UNINITIALIZED);
+
+        receiver.open();
+        sender.open();
+
+        assertEndpointState(receiver, EndpointState.ACTIVE, EndpointState.UNINITIALIZED);
+        assertEndpointState(sender, EndpointState.ACTIVE, EndpointState.UNINITIALIZED);
+
+        assertEvents(collector, Event.Type.CONNECTION_REMOTE_OPEN, Event.Type.SESSION_REMOTE_OPEN,
+                Event.Type.LINK_INIT, Event.Type.LINK_INIT, Event.Type.LINK_LOCAL_OPEN, Event.Type.TRANSPORT,
+                Event.Type.LINK_LOCAL_OPEN, Event.Type.TRANSPORT);
+
+        pumpMockTransport(transport);
+
+        assertEquals("Unexpected frames written: " + getFrameTypesWritten(transport), 4, transport.writes.size());
+        assertTrue("Unexpected frame type", transport.writes.get(2) instanceof Attach);
+        assertTrue("Unexpected frame type", transport.writes.get(3) instanceof Attach);
+
+        // Give the necessary responses to attach/attach
+        Attach recieverResponseAttach = new Attach();
+        recieverResponseAttach.setHandle(receiverHandle);
+        recieverResponseAttach.setRole(Role.SENDER);
+        recieverResponseAttach.setName(linkName);
+        recieverResponseAttach.setInitialDeliveryCount(UnsignedInteger.ZERO);
+        transport.handleFrame(new TransportFrame(0, recieverResponseAttach, null));
+
+        Attach senderResponseAttach = new Attach();
+        senderResponseAttach.setHandle(senderHandle);
+        senderResponseAttach.setRole(Role.RECEIVER);
+        senderResponseAttach.setName(linkName);
+        senderResponseAttach.setInitialDeliveryCount(UnsignedInteger.ZERO);
+        transport.handleFrame(new TransportFrame(0, senderResponseAttach, null));
+
+        // Verify the local link state was updated as expected
+
+        assertEndpointState(receiver, EndpointState.ACTIVE, EndpointState.ACTIVE);
+        assertEndpointState(sender, EndpointState.ACTIVE, EndpointState.ACTIVE);
+
+        assertEvents(collector, Event.Type.LINK_REMOTE_OPEN, Event.Type.LINK_REMOTE_OPEN);
+    }
+
+    protected void assertEndpointState(Endpoint endpoint, EndpointState localState, EndpointState remoteState)
+    {
+        assertEquals(localState, endpoint.getLocalState());
+        assertEquals(remoteState, endpoint.getRemoteState());
     }
 }
