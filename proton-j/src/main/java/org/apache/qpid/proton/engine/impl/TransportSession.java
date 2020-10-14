@@ -254,18 +254,24 @@ class TransportSession
 
     public TransportLink resolveHalfOpenLink(String name, boolean isSender)
     {
-        if(isSender) {
+        if(isSender)
+        {
             return _halfOpenSenderLinks.remove(name);
-        } else {
+        }
+        else
+        {
             return _halfOpenReceiverLinks.remove(name);
         }
     }
 
     public void addHalfOpenLink(TransportLink link, boolean isSender)
     {
-        if(isSender) {
+        if(isSender)
+        {
             _halfOpenSenderLinks.put(link.getName(), link);
-        } else {
+        }
+        else
+        {
             _halfOpenReceiverLinks.put(link.getName(), link);
         }
     }
